@@ -17,7 +17,11 @@ async def generate_flowchart(
             "error": f"diagram_type '{diagram_type}' is not supported. Use: er, flowchart, sequence"
         }
 
-    # Path A: Auto-ER from schema_data
+    # Path A: Auto-ER from schema_data (or fetch if not provided)
+    if diagram_type == "er" and not schema_data and not mermaid_code:
+        from tools.get_schema import get_schema
+        schema_data = await get_schema()
+
     if schema_data and "tables" in schema_data:
         mermaid_lines = ["erDiagram"]
         tables = schema_data["tables"]

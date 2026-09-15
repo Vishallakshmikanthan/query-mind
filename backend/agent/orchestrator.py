@@ -297,6 +297,87 @@ class AgentOrchestrator:
                 "message": f"Anthropic API call failed ({type(e).__name__}): {str(e)}"
             })
 
+    def _parse_tool_call(self, raw_text: str) -> Optional[tuple]:
+        """
+        Parses a tool call from model output across multiple formats:
+        1. <tool_call>...</tool_call>
+        2. ```json { "tool": ... } ```
+        3. Raw JSON { "tool": "...", "arguments": {...} } or { "name": "...", "parameters": {...} }
+        
+        Returns (tool_name, tool_inputs, pre_text) or None.
+        """
+        import re
+        import json
+
+        # 1. <tool_call> tags
+        match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", raw_text, re.DOTALL)
+        if match:
+            raw_json = re.sub(r"^\s*```(?:json)?\s*", "", match.group(1).strip())
+            raw_json = re.sub(r"\s*```\s*$", "", raw_json)
+            try:
+                data = json.loads(raw_json)
+                if isinstance(data, dict):
+                    name = data.get("tool") or data.get("name")
+                    inputs = data.get("arguments") or data.get("parameters") or data.get("input") or {}
+                    if name and isinstance(inputs, dict):
+                        return str(name), inputs, raw_text[:match.start()].strip()
+            except Exception:
+                pass
+
+        # 2. Markdown code fences
+        fence_match = re.search(r"```(?:json)?\s*(\{\s*[\"'](?:tool|name)[\"']\s*:.*?)\s*```", raw_text, re.DOTALL)
+        if fence_match:
+            try:
+                data = json.loads(fence_match.group(1).strip())
+                if isinstance(data, dict):
+                    name = data.get("tool") or data.get("name")
+                    inputs = data.get("arguments") or data.get("parameters") or data.get("input") or {}
+                    if name and isinstance(inputs, dict):
+                        return str(name), inputs, raw_text[:fence_match.start()].strip()
+            except Exception:
+                pass
+
+        # 3. Direct JSON object
+        json_match = re.search(r"(\{\s*[\"'](?:tool|name)[\"']\s*:\s*[\"'][a-zA-Z0-9_]+[\"'].*?\})", raw_text, re.DOTALL)
+        if json_match:
+            start_idx = json_match.start()
+            brace_count = 0
+            in_str = False
+            escape = False
+            end_idx = -1
+            for i in range(start_idx, len(raw_text)):
+                ch = raw_text[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\':
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if ch == '{':
+                        brace_count += 1
+                    elif ch == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i + 1
+                            break
+            if end_idx != -1:
+                candidate_json = raw_text[start_idx:end_idx].strip()
+                try:
+                    data = json.loads(candidate_json)
+                    if isinstance(data, dict):
+                        name = data.get("tool") or data.get("name")
+                        inputs = data.get("arguments") or data.get("parameters") or data.get("input") or {}
+                        if name and isinstance(inputs, dict):
+                            return str(name), inputs, raw_text[:start_idx].strip()
+                except Exception:
+                    pass
+
+        return None
+
     def _build_react_system_prompt(self) -> str:
         """Build a system prompt that embeds tool schemas for text-based ReAct (no function calling API needed)."""
         tool_descriptions = []
@@ -316,25 +397,37 @@ class AgentOrchestrator:
         tools_block = "\n\n".join(tool_descriptions)
         base = build_system_prompt()
         react_instructions = f"""
-You have access to the following tools. To call a tool, output ONLY a JSON block with this exact format (nothing else on that turn):
+You have access to the following tools to inspect data, execute queries, create visual charts, and generate interactive diagrams:
 
 <tool_call>
 {{"tool": "TOOL_NAME", "arguments": {{...}}}}
 </tool_call>
 
-After each tool result is shown to you, continue reasoning and either call another tool or give your final answer as plain text (no tool_call block).
-
 AVAILABLE TOOLS:
 {tools_block}
 
-Rules:
-- Always start by calling get_schema to understand the database.
-- Then call execute_query with a valid SELECT SQL statement.
-- To visualize data, call generate_chart after execute_query.
-- Give a final plain-text answer summarizing the results.
-- NEVER output a tool_call block in your final answer.
+CRITICAL RULES FOR VISUALIZATIONS & DIAGRAMS:
+1. Always start by calling `get_schema` if table structure is unknown.
+2. For database structure or relationship questions, call `generate_flowchart` with {{"diagram_type": "er", "title": "Database ER Diagram"}}.
+3. For process flows, lifecycles, or pipelines, call `generate_flowchart` with {{"diagram_type": "flowchart", "mermaid_code": "flowchart TD\\n...", "title": "..."}}.
+4. For numerical queries, top items, trends, or comparisons, first call `execute_query` to fetch the data rows, and then immediately call `generate_chart` with {{"chart_type": "bar"|"line"|"pie"|"scatter", "data": [...], "x_key": "...", "y_key": "...", "title": "..."}} so the frontend renders visual charts.
+5. In your final response after tool execution, provide a concise summary explaining the findings. Do NOT print raw JSON tool calls in your final text.
 """
         return base + react_instructions
+
+    def _get_openai_tools(self) -> List[Dict[str, Any]]:
+        """Format TOOL_SCHEMAS into standard OpenAI tool/function definitions."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema["description"],
+                    "parameters": schema.get("input_schema", {"type": "object", "properties": {}})
+                }
+            }
+            for schema in TOOL_SCHEMAS
+        ]
 
     async def _run_openai_loop(
         self,
@@ -343,8 +436,7 @@ Rules:
         message_id: str,
         show_sql: bool
     ) -> AsyncGenerator[str, None]:
-        """NVIDIA Nemotron text-based ReAct loop (no function-calling API required).
-        Tool schemas are embedded in the system prompt; tool calls are parsed from model text."""
+        """OpenAI / NVIDIA NIM ReAct loop supporting native tool calling and text fallback."""
         import re
 
         iterations = 0
@@ -353,132 +445,200 @@ Rules:
         charts_collected: List[Dict[str, Any]] = []
         diagrams_collected: List[Dict[str, Any]] = []
 
-        react_system = self._build_react_system_prompt()
-        oai_messages: List[Dict[str, Any]] = [{"role": "system", "content": react_system}]
+        system_prompt = build_system_prompt()
+        oai_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for m in messages:
             oai_messages.append({"role": m["role"], "content": m["content"]})
+
+        oai_tools = self._get_openai_tools()
 
         try:
             while iterations < MAX_TOOL_ITERATIONS:
                 iterations += 1
 
-                response = await self.openai_client.chat.completions.create(
-                    model=self.nvidia_model,
-                    messages=oai_messages,
-                    max_tokens=2048,
-                    temperature=0.1
-                )
+                try:
+                    response = await self.openai_client.chat.completions.create(
+                        model=self.nvidia_model,
+                        messages=oai_messages,
+                        tools=oai_tools,
+                        tool_choice="auto",
+                        temperature=0.1
+                    )
+                except Exception as api_call_err:
+                    # Fallback without native tools if provider does not support them
+                    react_system = self._build_react_system_prompt()
+                    if oai_messages and oai_messages[0].get("role") == "system":
+                        oai_messages[0]["content"] = react_system
+                    response = await self.openai_client.chat.completions.create(
+                        model=self.nvidia_model,
+                        messages=oai_messages,
+                        max_tokens=2048,
+                        temperature=0.1
+                    )
 
-                raw_text: str = response.choices[0].message.content or ""
+                choice = response.choices[0]
+                msg = choice.message
+                raw_text: str = msg.content or ""
+                tool_calls = getattr(msg, "tool_calls", None)
 
-                # Check if model wants to call a tool
-                tool_match = re.search(
-                    r"<tool_call>\s*(.*?)\s*</tool_call>",
-                    raw_text,
-                    re.DOTALL
-                )
-
-                if tool_match:
-                    # Extract any text before the tool call and stream it as thinking
-                    pre_text = raw_text[:tool_match.start()].strip()
-                    if pre_text:
-                        async for tok in _stream_text(pre_text + " "):
-                            yield tok
-                            await asyncio.sleep(0.005)
-
-                    tool_name = ""
-                    tool_inputs = {}
-                    try:
-                        raw_json = tool_match.group(1).strip()
-                        raw_json = re.sub(r"^```(?:json)?\s*", "", raw_json)
-                        raw_json = re.sub(r"\s*```$", "", raw_json)
-                        call_data = json.loads(raw_json)
-                        if isinstance(call_data, dict):
-                            tool_name = str(call_data.get("tool", ""))
-                            tool_inputs = call_data.get("arguments", {})
-                            if not isinstance(tool_inputs, dict):
-                                tool_inputs = {}
-                        else:
-                            tool_match = None
-                    except Exception as parse_err:
-                        print(f"[Tool Call Parse Error]: {parse_err}. Raw: {tool_match.group(1)[:200]}")
-                        tool_match = None
-
-                if tool_match and tool_name:
-                    # Append assistant message
-                    oai_messages.append({"role": "assistant", "content": raw_text})
-
-                    # Event: tool_start
-                    yield format_sse({"type": "tool_start", "tool": tool_name})
-                    await asyncio.sleep(0.03)
-
-                    # Execute tool via registry
-                    res_envelope = await execute_tool(tool_name, tool_inputs)
-
-                    if tool_name == "get_schema" and res_envelope.get("success"):
-                        session_store.set_schema_cache(session_id, res_envelope)
-                    success = res_envelope.get("success", False)
-
-                    # Event: tool_end
-                    yield format_sse({"type": "tool_end", "tool": tool_name, "success": success})
-
-                    # Derived SSE events
-                    if tool_name == "execute_query" and success and show_sql:
-                        sql = res_envelope.get("sql") or res_envelope.get("sql_executed")
-                        if sql:
-                            sql_statements_used.append(sql)
-                            yield format_sse({"type": "sql", "content": sql})
-                    elif tool_name == "generate_chart" and success:
-                        chart_event = {
-                            "type": "chart",
-                            "chart_type": res_envelope.get("chart_type", "bar"),
-                            "title": res_envelope.get("title", ""),
-                            "data": res_envelope.get("data", []),
-                            "config": res_envelope.get("config", {})
-                        }
-                        charts_collected.append(chart_event)
-                        yield format_sse(chart_event)
-                    elif tool_name == "generate_flowchart" and success:
-                        diagram_event = {
-                            "type": "diagram",
-                            "diagram_type": res_envelope.get("diagram_type", "flowchart"),
-                            "title": res_envelope.get("title", ""),
-                            "mermaid": res_envelope.get("mermaid", "")
-                        }
-                        diagrams_collected.append(diagram_event)
-                        yield format_sse(diagram_event)
-
-                    # Feed tool result back as user turn (ReAct pattern)
-                    result_summary = json.dumps(res_envelope)
-                    if len(result_summary) > 3000:
-                        result_summary = result_summary[:3000] + "... [truncated]"
+                if tool_calls:
+                    # Append assistant message with tool calls
                     oai_messages.append({
-                        "role": "user",
-                        "content": f"Tool result for {tool_name}:\n{result_summary}\n\nContinue reasoning."
+                        "role": "assistant",
+                        "content": raw_text,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            }
+                            for tc in tool_calls
+                        ]
                     })
 
+                    for tc in tool_calls:
+                        tool_name = tc.function.name
+                        try:
+                            tool_inputs = json.loads(tc.function.arguments or "{}")
+                        except Exception:
+                            tool_inputs = {}
+
+                        # Event: tool_start
+                        yield format_sse({"type": "tool_start", "tool": tool_name})
+                        await asyncio.sleep(0.03)
+
+                        # Execute tool via registry
+                        res_envelope = await execute_tool(tool_name, tool_inputs)
+
+                        if tool_name == "get_schema" and res_envelope.get("success"):
+                            session_store.set_schema_cache(session_id, res_envelope)
+                        success = res_envelope.get("success", False)
+
+                        # Event: tool_end
+                        yield format_sse({"type": "tool_end", "tool": tool_name, "success": success})
+
+                        # Derived SSE events
+                        if tool_name == "execute_query" and success and show_sql:
+                            sql = res_envelope.get("sql") or res_envelope.get("sql_executed")
+                            if sql:
+                                sql_statements_used.append(sql)
+                                yield format_sse({"type": "sql", "content": sql})
+                        elif tool_name == "generate_chart" and success:
+                            chart_event = {
+                                "type": "chart",
+                                "chart_type": res_envelope.get("chart_type", "bar"),
+                                "title": res_envelope.get("title", ""),
+                                "data": res_envelope.get("data", []),
+                                "config": res_envelope.get("config", {})
+                            }
+                            charts_collected.append(chart_event)
+                            yield format_sse(chart_event)
+                        elif tool_name == "generate_flowchart" and success:
+                            diagram_event = {
+                                "type": "diagram",
+                                "diagram_type": res_envelope.get("diagram_type", "flowchart"),
+                                "title": res_envelope.get("title", ""),
+                                "mermaid": res_envelope.get("mermaid", "")
+                            }
+                            diagrams_collected.append(diagram_event)
+                            yield format_sse(diagram_event)
+
+                        # Feed tool result back to model
+                        result_summary = json.dumps(res_envelope)
+                        if len(result_summary) > 4000:
+                            result_summary = result_summary[:4000] + "... [truncated]"
+                        oai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_summary
+                        })
+
                 else:
-                    # No tool call — this is the final answer
-                    final_text = re.sub(r"<tool_call>.*?</tool_call>", "", raw_text, flags=re.DOTALL).strip()
-                    final_text = re.sub(r"</?tool_call>", "", final_text).strip()
-                    if not final_text:
-                        final_text = "Analysis complete."
+                    # Check text-based fallback tool parsing
+                    parsed_tool = self._parse_tool_call(raw_text)
 
-                    assistant_response_content.append(final_text)
-                    async for token_event in _stream_text(final_text):
-                        yield token_event
-                        await asyncio.sleep(0.008)
+                    if parsed_tool:
+                        tool_name, tool_inputs, pre_text = parsed_tool
+                        oai_messages.append({"role": "assistant", "content": raw_text})
 
-                    session_store.add_message(
-                        session_id,
-                        "assistant",
-                        final_text,
-                        charts=charts_collected,
-                        sql_used=sql_statements_used,
-                        diagrams=diagrams_collected
-                    )
-                    yield format_sse({"type": "done", "message_id": message_id})
-                    return
+                        yield format_sse({"type": "tool_start", "tool": tool_name})
+                        await asyncio.sleep(0.03)
+
+                        res_envelope = await execute_tool(tool_name, tool_inputs)
+                        if tool_name == "get_schema" and res_envelope.get("success"):
+                            session_store.set_schema_cache(session_id, res_envelope)
+                        success = res_envelope.get("success", False)
+
+                        yield format_sse({"type": "tool_end", "tool": tool_name, "success": success})
+
+                        if tool_name == "execute_query" and success and show_sql:
+                            sql = res_envelope.get("sql") or res_envelope.get("sql_executed")
+                            if sql:
+                                sql_statements_used.append(sql)
+                                yield format_sse({"type": "sql", "content": sql})
+                        elif tool_name == "generate_chart" and success:
+                            chart_event = {
+                                "type": "chart",
+                                "chart_type": res_envelope.get("chart_type", "bar"),
+                                "title": res_envelope.get("title", ""),
+                                "data": res_envelope.get("data", []),
+                                "config": res_envelope.get("config", {})
+                            }
+                            charts_collected.append(chart_event)
+                            yield format_sse(chart_event)
+                        elif tool_name == "generate_flowchart" and success:
+                            diagram_event = {
+                                "type": "diagram",
+                                "diagram_type": res_envelope.get("diagram_type", "flowchart"),
+                                "title": res_envelope.get("title", ""),
+                                "mermaid": res_envelope.get("mermaid", "")
+                            }
+                            diagrams_collected.append(diagram_event)
+                            yield format_sse(diagram_event)
+
+                        result_summary = json.dumps(res_envelope)
+                        if len(result_summary) > 4000:
+                            result_summary = result_summary[:4000] + "... [truncated]"
+                        oai_messages.append({
+                            "role": "user",
+                            "content": f"Tool result for {tool_name}:\n{result_summary}\n\nContinue reasoning."
+                        })
+                    else:
+                        # Final response text - clean any reasoning tags or loop artifacts
+                        final_text = raw_text
+                        final_text = re.sub(r"(?i)Here'?s a thinking process:.*?(?=\n\n[A-Z0-9#]|\Z)", "", final_text, flags=re.DOTALL).strip()
+                        final_text = re.sub(r"<think>.*?</think>", "", final_text, flags=re.DOTALL).strip()
+                        final_text = re.sub(r"<tool_call>.*?</tool_call>", "", final_text, flags=re.DOTALL).strip()
+                        final_text = re.sub(r"</?tool_call>", "", final_text).strip()
+                        final_text = re.sub(r"```(?:json)?\s*\{\s*[\"'](?:tool|name)[\"'].*?\}\s*```", "", final_text, flags=re.DOTALL).strip()
+                        final_text = re.sub(r"\{\s*[\"'](?:tool|name)[\"']\s*:\s*[\"'][a-zA-Z0-9_]+[\"'].*?\}", "", final_text, flags=re.DOTALL).strip()
+
+                        if not final_text:
+                            if charts_collected:
+                                final_text = "Here are the visual analytics charts generated for your query."
+                            elif diagrams_collected:
+                                final_text = "Here is the generated diagram."
+                            else:
+                                final_text = "Analysis complete."
+
+                        assistant_response_content.append(final_text)
+                        async for token_event in _stream_text(final_text):
+                            yield token_event
+                            await asyncio.sleep(0.008)
+
+                        session_store.add_message(
+                            session_id,
+                            "assistant",
+                            final_text,
+                            charts=charts_collected,
+                            sql_used=sql_statements_used,
+                            diagrams=diagrams_collected
+                        )
+                        yield format_sse({"type": "done", "message_id": message_id})
+                        return
 
             yield format_sse({
                 "type": "error",
@@ -641,7 +801,12 @@ Rules:
         if chart_type and rows:
             cols = list(rows[0].keys()) if rows else []
             x_key = cols[0] if cols else "category"
-            y_key = cols[1] if len(cols) > 1 else cols[0]
+            y_key = cols[-1] if cols else "value"
+            for col in cols:
+                sample_val = rows[0].get(col)
+                if isinstance(sample_val, (int, float)) and col != cols[0]:
+                    y_key = col
+                    break
 
             yield format_sse({"type": "tool_start", "tool": "generate_chart"})
             chart_res = await execute_tool("generate_chart", {
@@ -684,6 +849,11 @@ Rules:
 
     def _choose_offline_query(self, lower_msg: str) -> str:
         """Pick a representative query for the offline fallback path."""
+        if "online_retail" in lower_msg or "transaction" in lower_msg:
+            return (
+                "SELECT invoice, description, quantity, price, (quantity * price) AS total_value "
+                "FROM online_retail_transactions ORDER BY total_value DESC LIMIT 10"
+            )
         if "top" in lower_msg and "revenue" in lower_msg:
             return (
                 "SELECT p.name AS product_name, SUM(oi.quantity * oi.unit_price) AS total_revenue "

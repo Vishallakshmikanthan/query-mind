@@ -146,3 +146,53 @@ async def export_csv(
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+
+from fastapi import UploadFile, File
+from pydantic import BaseModel
+from tools.ingest_dataset import ingest_file, download_kaggle_dataset
+
+
+class KaggleImportRequest(BaseModel):
+    url_or_code: str
+
+
+@router.post("/dataset/upload")
+async def upload_dataset(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_auth)
+):
+    """POST /api/dataset/upload - Ingest uploaded ZIP, CSV, or SQLite dataset file."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "EMPTY_FILE", "message": "Uploaded file is empty."}
+        )
+    res = await ingest_file(file.filename or "uploaded_dataset.csv", content)
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INGEST_FAILED", "message": res.get("error", "Failed to ingest dataset")}
+        )
+    return res
+
+
+@router.post("/dataset/kaggle")
+async def kaggle_dataset(
+    req: KaggleImportRequest,
+    user: dict = Depends(require_auth)
+):
+    """POST /api/dataset/kaggle - Fetch and ingest Kaggle dataset by URL or code."""
+    if not req.url_or_code or not req.url_or_code.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "EMPTY_KAGGLE_INPUT", "message": "Kaggle URL or code cannot be empty."}
+        )
+    res = await download_kaggle_dataset(req.url_or_code.strip())
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "KAGGLE_IMPORT_FAILED", "message": res.get("error", "Failed to import Kaggle dataset")}
+        )
+    return res
+

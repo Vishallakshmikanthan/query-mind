@@ -31,8 +31,16 @@ export const DatasetModal: React.FC<DatasetModalProps> = ({ isOpen, onClose, onS
         body: formData,
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail?.message || data.error || 'Upload failed');
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = {};
+      }
+
+      if (!res.ok) {
+        throw new Error(data.detail?.message || data.error || data.message || `Upload failed with status ${res.status}`);
+      }
 
       setMessage({
         type: 'success',
@@ -59,11 +67,19 @@ export const DatasetModal: React.FC<DatasetModalProps> = ({ isOpen, onClose, onS
       const res = await authenticatedFetch('/api/dataset/kaggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url_or_code: kaggleInput }),
+        body: JSON.stringify({ url_or_code: kaggleInput.trim() }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail?.message || data.error || 'Kaggle import failed');
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = {};
+      }
+
+      if (!res.ok) {
+        throw new Error(data.detail?.message || data.error || data.message || `Kaggle import failed with status ${res.status}`);
+      }
 
       setMessage({
         type: 'success',

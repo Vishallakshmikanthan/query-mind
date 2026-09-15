@@ -8,7 +8,7 @@ describe('MessageInput', () => {
     const onStop = vi.fn();
     render(<MessageInput onSend={onSend} onStop={onStop} disabled={false} status="idle" />);
 
-    const textarea = screen.getByPlaceholderText(/Ask a database question/i);
+    const textarea = screen.getByPlaceholderText(/Ask anything about your data/i);
     fireEvent.change(textarea, { target: { value: 'Show orders' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
 
@@ -19,7 +19,7 @@ describe('MessageInput', () => {
     const onSend = vi.fn();
     render(<MessageInput onSend={onSend} onStop={vi.fn()} disabled={false} status="idle" />);
 
-    const textarea = screen.getByPlaceholderText(/Ask a database question/i);
+    const textarea = screen.getByPlaceholderText(/Ask anything about your data/i);
     fireEvent.change(textarea, { target: { value: 'line 1' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
 
@@ -43,6 +43,6 @@ describe('MessageInput', () => {
     const chip = screen.getByText(/top 5 products by revenue/i);
     fireEvent.click(chip);
 
-    expect(onSend).toHaveBeenCalledWith('Show top 5 products by revenue this quarter');
+    expect(onSend).toHaveBeenCalledWith('Top 5 products by revenue as a chart');
   });
 });

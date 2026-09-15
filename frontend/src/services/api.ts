@@ -71,7 +71,13 @@ export async function authenticatedFetch(
 ): Promise<Response> {
   const headers = new Headers(init.headers || {});
   const authHeaders = getAuthHeaders();
+  const isFormData = typeof FormData !== 'undefined' && init.body instanceof FormData;
+
   Object.entries(authHeaders).forEach(([key, value]) => {
+    if (key.toLowerCase() === 'content-type' && isFormData) {
+      // Do not set Content-Type for FormData; browser sets multipart/form-data with boundary
+      return;
+    }
     if (!headers.has(key)) {
       headers.set(key, value);
     }
